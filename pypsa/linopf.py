@@ -703,7 +703,7 @@ def assign_solution(n, sns, variables_sol, constraints_dual,
     for c, attr in lookup.query('nominal').index:
         if attr not in n.pnl(c).keys():
             n.pnl(c)[attr] = pd.DataFrame(index=sns)
-        n.pnl(c)[attr+'_opt'] = get_switchable_as_dense(n, c, attr)
+        n.pnl(c)[attr+'_opt'] = get_as_dense(n, c, attr)
         del n.pnl(c)[attr]
         
     # recalculate storageunit net dispatch
