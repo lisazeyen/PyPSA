@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 lookup = pd.read_csv(os.path.join(os.path.dirname(__file__), 'variables.csv'),
                      index_col=['component', 'variable'])
 
-
+#%%
 def define_nominal_for_extendable_variables(n, c, attr):
     """
     Initializes variables for nominal capacities for a given component and a
@@ -353,7 +353,7 @@ def define_kirchhoff_constraints(n, sns):
     set_conref(n, constraints, 'SubNetwork', 'mu_kirchhoff_voltage_law')
 
 
-def define_storage_unit_constraints(n, sns):
+def define_storage_unit_constraints(n, sns, typical_period):
     """
     Defines state of charge (soc) constraints for storage units. In principal
     the constraints states:
@@ -369,40 +369,137 @@ def define_storage_unit_constraints(n, sns):
     spill = write_bound(n, 0, upper)
     set_varref(n, spill, 'StorageUnit', 'spill')
 
-    eh = expand_series(n.snapshot_weightings[sns], sus_i) #elapsed hours
+    eh = expand_series(n.snapshot_weightings.loc[sns], sus_i) #elapsed hours
 
     eff_stand = expand_series(1-n.df(c).standing_loss, sns).T.pow(eh)
     eff_dispatch = expand_series(n.df(c).efficiency_dispatch, sns).T
     eff_store = expand_series(n.df(c).efficiency_store, sns).T
 
     soc = get_var(n, c, 'state_of_charge')
-    cyclic_i = n.df(c).query('cyclic_state_of_charge').index
-    noncyclic_i = n.df(c).query('~cyclic_state_of_charge').index
-
-    prev_soc_cyclic = soc.shift().fillna(soc.loc[sns[-1]])
-
-    coeff_var = [(-1, soc),
-                 (-1/eff_dispatch * eh, get_var(n, c, 'p_dispatch')),
-                 (eff_store * eh, get_var(n, c, 'p_store'))]
-
-    lhs, *axes = linexpr(*coeff_var, return_axes=True)
 
     def masked_term(coeff, var, cols):
         return linexpr((coeff[cols], var[cols]))\
                .reindex(index=axes[0], columns=axes[1], fill_value='').values
 
-    if ('StorageUnit', 'spill') in n.variables.index:
-        lhs += masked_term(-eh, get_var(n, c, 'spill'), spill.columns)
-    lhs += masked_term(eff_stand, prev_soc_cyclic, cyclic_i)
-    lhs += masked_term(eff_stand.loc[sns[1:]], soc.shift().loc[sns[1:]], noncyclic_i)
+    if typical_period:
+        # According to:
+        # L. Kotzur et al: 'Time series aggregation for energy system design:
+        # Modeling seasonal storage', 2018
 
-    rhs = -get_as_dense(n, c, 'inflow', sns).mul(eh)
-    rhs.loc[sns[0], noncyclic_i] -= n.df(c).state_of_charge_initial[noncyclic_i]
+        # set multiindex([typical day=k, hour=g])
+        sns_multi = pd.MultiIndex.from_tuples(sns)
 
-    define_constraints(n, lhs, '==', rhs, c, 'mu_state_of_charge')
+        #######################################################################
+        # (1) intra period constraints -  Kotzur paper eq. 18 -----------------
+        # define new variable for state of charge (soc) within typical day (intra period)
+        soc_intra = define_variables(n, -inf, inf, c, "state_of_charge_intra",
+                                     axes=[sns_multi, sus_i])
+
+        # soc_intra at first hour of each intra period constraint to be zero
+        lhs = linexpr((1, soc_intra.xs(0, level=1)))
+        define_constraints(n, lhs, '==', 0, c, 'mu_state_of_charge_intra_first')
+
+        # SOC_{period, t} ---------------------------------------------------
+        previous_soc_intra = soc_intra.groupby(level=0).shift().dropna()
+        # (1-nu_self * dt) with time step: dt = 1h
+        eff_stand_intra = (expand_series(1-n.df(c).standing_loss, sns_multi).T
+                           .groupby(level=0).shift().dropna())
+
+        # lhs = -soc_intra + p_store - p_dispatch - spill + previous_soc_intra
+        lhs = linexpr(
+                     # (eff_stand_intra, previous_soc_intra),    # (1-nu_self dt) * SOC_{period, t}
+                     (eff_store, get_var(n, c, 'p_store')),    # nu_charge * p_store_{period, t}
+                     (-1/eff_dispatch, get_var(n, c, 'p_dispatch')),    # -1/nu_discharge * p_dispatch_{period, t}
+                     (-1, soc_intra)                                      # SOC_{period, t+1}
+                      )
+
+        axes = [lhs.index, lhs.columns]
+        lhs += masked_term(eff_stand_intra, previous_soc_intra, sus_i)
+
+        if ('StorageUnit', 'spill') in n.variables.index:
+            spill = linexpr((-eh[spill.columns], get_var(n, c, 'spill')))
+            lhs[spill.columns] += spill
 
 
-def define_store_constraints(n, sns):
+        # rhs = -inflow - initial_state_of_charge
+        rhs = -get_as_dense(n, c, 'inflow', sns).reindex(sns_multi)
+
+        lhs.drop(0, level=1, inplace=True)
+        rhs.drop(0, level=1, inplace=True)
+
+        define_constraints(n, lhs, '==', rhs, c, 'mu_state_of_charge_intra')
+
+        #######################################################################
+        # (2) inter period constraints - Kotzur paper eq. 19 ------------------
+        # define new variable for state of charge (soc) between periods (inter)
+        soc_inter = define_variables(n, -inf, inf, c, "state_of_charge_inter",
+                             axes=[sns_multi.levels[0], sus_i])
+
+        # For the last reperesentive day, the soc_inter is the same as the
+        # first day
+        lhs = linexpr((1, soc_inter.iloc[0,:]),
+                      (-1, soc_inter.iloc[-1,:]))
+        define_constraints(n, lhs, '==', 0, c, 'mu_state_of_charge_inter_first')
+
+        # -------------------------------------------------------------------
+        previous_soc_inter = soc_inter.shift().iloc[1:,:]
+        # assume typical day, number of time steps within period N_g = 24 hours
+        time_steps_within_period = 24
+        eff_stand_inter = expand_series(1-n.df(c).standing_loss, sns_multi.levels[0]).T.pow(time_steps_within_period).iloc[1:,:]
+        # soc_inter(period+1, storageunit) = (soc_inter(period, storageunit)*eff_stand_inter
+        #                                   + soc_intra(period, last_hour))
+        # -soc_inter(period+1, storageunit) + soc_inter(period, storageunit)*eff_stand_inter
+        lhs = linexpr((-1, soc_inter.iloc[1:,:]),
+                       (eff_stand_inter, previous_soc_inter)
+                      )
+        # soc intra last hour: soc_intra(period, last_hour)
+        soc_intra_last = linexpr((-1, soc_intra),
+                                (-1/eff_dispatch, get_var(n, c, 'p_dispatch')),
+                                (eff_store, get_var(n, c, 'p_store'))).groupby(level=0).last()
+        lhs += soc_intra_last.iloc[1:,:]
+
+        rhs = -get_as_dense(n, c, 'inflow', sns).reindex(sns_multi).groupby(level=0).first().iloc[1:,:]
+
+        define_constraints(n, lhs, '==', rhs, c, 'mu_state_of_charge_inter')
+
+        # (3) state of charge constraint, Kotzur paper eq. 20 ------------
+        lhs = linexpr((eff_stand_inter.reindex(sns_multi, level=0),
+                       soc_inter.reindex(sns_multi,level=0)),
+                       (1, soc_intra),
+                       (-1, soc.reindex(sns_multi))
+                      )
+
+        define_constraints(n, lhs, '==', 0, c, 'mu_state_of_charge')
+
+
+
+    # no typical periods
+    else:
+        cyclic_i = n.df(c).query('cyclic_state_of_charge').index
+        noncyclic_i = n.df(c).query('~cyclic_state_of_charge').index
+
+        prev_soc_cyclic = soc.shift().fillna(soc.iloc[-1])
+
+        coeff_var = [(-1, soc),
+                     (-1/eff_dispatch * eh, get_var(n, c, 'p_dispatch')),
+                     (eff_store * eh, get_var(n, c, 'p_store'))]
+
+        lhs, *axes = linexpr(*coeff_var, return_axes=True)
+
+
+        if ('StorageUnit', 'spill') in n.variables.index:
+            lhs += masked_term(-eh, get_var(n, c, 'spill'), spill.columns)
+        lhs += masked_term(eff_stand, prev_soc_cyclic, cyclic_i)
+        lhs += masked_term(eff_stand.loc[sns[1:]], soc.shift().loc[sns[1:]], noncyclic_i)
+
+        rhs = -get_as_dense(n, c, 'inflow', sns).mul(eh)
+        rhs.loc[[sns[0]], noncyclic_i] -= n.df(c).state_of_charge_initial[noncyclic_i]
+
+        define_constraints(n, lhs, '==', rhs, c, 'mu_state_of_charge')
+
+
+
+def define_store_constraints(n, sns, typical_period):
     """
     Defines energy balance constraints for stores. In principal this states:
 
@@ -419,6 +516,9 @@ def define_store_constraints(n, sns):
     eff_stand = expand_series(1-n.df(c).standing_loss, sns).T.pow(eh)
 
     e = get_var(n, c, 'e')
+    if typical_period:
+        sns_multi = pd.MultiIndex.from_tuples(sns)
+        e = e.reindex(sns_multi)
     cyclic_i = n.df(c).query('e_cyclic').index
     noncyclic_i = n.df(c).query('~e_cyclic').index
 
@@ -436,6 +536,8 @@ def define_store_constraints(n, sns):
     lhs += masked_term(eff_stand.loc[sns[1:]], e.shift().loc[sns[1:]], noncyclic_i)
 
     rhs = pd.DataFrame(0, sns, stores_i)
+    if typical_period:
+        rhs = pd.DataFrame(0, sns_multi, stores_i)
     rhs.loc[sns[0], noncyclic_i] -= n.df(c)['e_initial'][noncyclic_i]
 
     define_constraints(n, lhs, '==', rhs, c, 'mu_state_of_charge')
@@ -572,7 +674,7 @@ def define_objective(n, sns):
 
 
 def prepare_lopf(n, snapshots=None, keep_files=False, skip_objective=False,
-                 extra_functionality=None, solver_dir=None):
+                 extra_functionality=None, solver_dir=None, typical_period=False):
     """
     Sets up the linear problem and writes it out to a lp file.
 
@@ -627,8 +729,10 @@ def prepare_lopf(n, snapshots=None, keep_files=False, skip_objective=False,
 
     define_committable_generator_constraints(n, snapshots)
     define_ramp_limit_constraints(n, snapshots)
-    define_storage_unit_constraints(n, snapshots)
-    define_store_constraints(n, snapshots)
+    print("typical period is set to ", typical_period)
+    define_storage_unit_constraints(n, snapshots, typical_period)
+    define_store_constraints(n, snapshots, typical_period)
+
     define_kirchhoff_constraints(n, snapshots)
     define_nodal_balance_constraints(n, snapshots)
     define_global_constraints(n, snapshots)
@@ -700,6 +804,9 @@ def assign_solution(n, sns, variables_sol, constraints_dual,
                     set_from_frame(pnl, f'p{i}', - values * eff)
                     pnl[f'p{i}'].loc[sns, n.links.index[n.links[f'bus{i}'] == ""]] = \
                         n.component_attrs['Link'].loc[f'p{i}','default']
+            elif c == "StorageUnit" and attr=="state_of_charge_inter":
+                pnl[attr] = values.reindex(pd.MultiIndex.from_tuples(n.snapshots), level=0)
+                pnl[attr].index = pnl[attr].index.to_flat_index()
             else:
                 set_from_frame(pnl, attr, values)
         else:
@@ -815,7 +922,7 @@ def assign_solution(n, sns, variables_sol, constraints_dual,
 
 def network_lopf(n, snapshots=None, solver_name="cbc",
          solver_logfile=None, extra_functionality=None, skip_objective=False,
-         skip_pre=False, extra_postprocessing=None, formulation="kirchhoff",
+         skip_pre=False, extra_postprocessing=None, formulation="kirchhoff", typical_period=False,
          keep_references=False, keep_files=False,
          keep_shadowprices=['Bus', 'Line', 'Transformer', 'Link', 'GlobalConstraint'],
          solver_options=None, warmstart=False, store_basis=False,
@@ -905,7 +1012,7 @@ def network_lopf(n, snapshots=None, solver_name="cbc",
 
     logger.info("Prepare linear problem")
     fdp, problem_fn = prepare_lopf(n, snapshots, keep_files, skip_objective,
-                                   extra_functionality, solver_dir)
+                                   extra_functionality, solver_dir, typical_period)
     fds, solution_fn = mkstemp(prefix='pypsa-solve', suffix='.sol', dir=solver_dir)
 
     if warmstart == True:

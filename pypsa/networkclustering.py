@@ -35,7 +35,7 @@ from .components import Network
 from .geo import haversine_pts
 
 from . import io
-
+#%%
 def _normed(s):
     tot = s.sum()
     if tot == 0:
@@ -346,7 +346,7 @@ def busmap_by_spectral_clustering(network, n_clusters, **kwds):
             "or 'pip install scikit-learn'")
 
     from sklearn.cluster import spectral_clustering as sk_spectral_clustering
-    
+
     lines = network.lines.loc[:,['bus0', 'bus1']].assign(weight=network.lines.num_parallel).set_index(['bus0','bus1'])
     lines.weight+=0.1
     G = nx.Graph()
@@ -566,3 +566,107 @@ def stubs_clustering(network,use_reduced_coordinates=True, line_length_factor=1.
         network.buses.loc[busmap.index,['x','y']] = network.buses.loc[busmap,['x','y']].values
 
     return get_clustering_from_busmap(network, busmap, line_length_factor=line_length_factor)
+
+
+def aggregate_snapshots(n, n_periods=12, hours=24, normed=True, solver="glpk",
+                        extremePeriodMethod="None", clusterMethod='hierarchical',
+                        predefClusterOrder=None):
+    """
+    this function aggregates the snapshots of the pypsa Network to a number of
+    typical periods (n_periods) with a given length in hours (hours).
+    The mapping from the original timeseries to the aggregated typical periods
+    is saved in n.cluster
+
+    Default is 12 typical days with hierachical clustering and without
+    a extremePeriodMethod.
+
+    Parameters
+    ----------
+    n :                 pypsa.Network
+    n_periods:          int
+                        number of typical periods
+    hours:              int
+                        hours per period
+    extremePeriodMethod: {'None','append','new_cluster_center',
+                           'replace_cluster_center'}, default: 'None'
+                        Method how to integrate extreme periods into to the
+                        typical period profiles.
+                        None: No integration at all.
+                        'append': append typical Periods to cluster centers
+                        'new_cluster_center': add the extreme period as additional cluster
+                             center. It is checked then for all Periods if they fit better
+                            to the this new center or their original cluster center.
+                        'replace_cluster_center': replaces the cluster center of the
+                            cluster where the extreme period belongs to with the periodly
+                            profile of the extreme period. (Worst case system design)
+    ClusterMethod:      {'averaging', 'k_medoids', 'k_means', 'hierarchical'},
+                        default: 'hierachical'
+    predefClusterOrder: list or array (default: None)
+                        Instead of aggregating a time series, a predefined
+                        grouping is taken which is given by this list.
+
+    Returns
+    -------
+
+
+    """
+    # check if module is installed
+    if find_spec('tsam') is None:
+        raise ModuleNotFoundError("Optional dependency 'tsam' not found."
+                                  "Install via 'pip install tsam'")
+    import tsam.timeseriesaggregation as tsam
+
+    # get time dependent data to determinate typcial timeseries
+    timeseries_df = pd.DataFrame(index=n.snapshots)
+    for component in n.all_components:
+        pnl = n.pnl(component)
+        for key in pnl.keys():
+            if not pnl[key].empty:
+                timeseries_df = pd.concat([timeseries_df, pnl[key]], axis=1)
+
+    if normed:
+        timeseries_agg = timeseries_df / timeseries_df.max()
+    else:
+        timeseries_agg = timeseries_df
+
+    logger.info(("Aggregate snapshots to {} periods with {} hours using "
+                 "cluster method: {}, extreme period method: {}"
+                .format(n_periods, hours, clusterMethod, extremePeriodMethod)))
+
+    aggregation = tsam.TimeSeriesAggregation(
+                            timeseries_agg,
+                            noTypicalPeriods=n_periods,
+                            hoursPerPeriod=hours,
+                            extremePeriodMethod=extremePeriodMethod,
+                            # rescaleClusterPeriods: Decides if the cluster Periods shall get rescaled such
+                            # that their weighted mean value fits the mean value of the original time series.
+                            rescaleClusterPeriods=False,
+                            clusterMethod=clusterMethod,
+                            solver=solver,
+                            predefClusterOrder=predefClusterOrder,
+                            )
+
+    clustered = aggregation.createTypicalPeriods()
+    if normed:
+        clustered = clustered.mul(timeseries_df.max())
+    weightings = pd.DataFrame.from_dict(aggregation._clusterPeriodNoOccur,
+                                        orient="index").reindex(clustered.index,level=0)
+    weightings.index = weightings.index.to_flat_index()
+    # pd.Dataframe (index=original time series, columns=[PeriodNum, TimeStep])
+    map_snapshots_to_periods = aggregation.indexMatching()
+    map_snapshots_to_periods["day_of_year"] = map_snapshots_to_periods.index.day_of_year
+    # how often does a a typical period occur in the original time series
+    cluster_order = aggregation.clusterOrder
+    # clustered_ind = timeseries_df.iloc[aggregation.clusterCenterIndices].index
+
+    # set new snapshots and snapshot weightings
+    n.set_snapshots(clustered.index.to_flat_index())
+    n.snapshot_weightings = weightings[0]
+    for component in n.all_components:
+        pnl = n.pnl(component)
+        for key in pnl.keys():
+            if not pnl[key].empty:
+                pnl[key] = clustered[pnl[key].columns]
+
+    # save mapping original timeseries to aggregated
+    n.cluster = map_snapshots_to_periods

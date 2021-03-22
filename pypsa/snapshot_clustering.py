@@ -19,7 +19,7 @@
 
 # File description for read-the-docs
 """ This module contains functions for calculating representative days/weeks
-based on a pyPSA network object. It is designed to be used for the `lopf`
+based on a PyPSA network object. It is designed to be used for the `lopf`
 method. Essentially the tsam package
 ( https://github.com/FZJ-IEK3-VSA/tsam ), which is developed by
 Leander Kotzur is used.
@@ -31,10 +31,9 @@ Remaining questions/tasks:
 """
 
 import pandas as pd
-import os
-if 'READTHEDOCS' not in os.environ:
-    import pyomo.environ as po
-    import tsam.timeseriesaggregation as tsam
+import tsam.timeseriesaggregation as tsam
+import numpy as np
+
 
 __copyright__ = ("Flensburg University of Applied Sciences, "
                  "Europa-Universität Flensburg, "
@@ -43,7 +42,7 @@ __license__ = "GNU Affero General Public License Version 3 (AGPL-3.0)"
 __author__ = "Simon Hilpert"
 
 
-def snapshot_clustering(network, how='daily', clusters=10):
+def snapshot_clustering(network, how='daily', clusters=12):
     """
     """
 
@@ -54,14 +53,21 @@ def snapshot_clustering(network, how='daily', clusters=10):
 
 
 def tsam_cluster(timeseries_df,
-                 typical_periods=10,
-                 how='daily',
-                 extremePeriodMethod = 'None'):
+                 typical_periods=12,
+                 hours=24,
+                 extremePeriodMethod='None',
+                 clusterMethod='hierarchical',
+                 solver="glpk",
+                 predefClusterOrder=None):
     """
     Parameters
     ----------
-    df : pd.DataFrame
-        DataFrame with timeseries to cluster
+    timeseries_df : pd.DataFrame(index=timeseries, columns=relevant time series parameters)
+                    DataFrame with timeseries to cluster
+    typical_periods: int
+                     number of typical periods
+    hours:            int
+                    hours per period
     extremePeriodMethod: {'None','append','new_cluster_center',
                            'replace_cluster_center'}, default: 'None'
         Method how to integrate extreme Periods
@@ -74,6 +80,11 @@ def tsam_cluster(timeseries_df,
         'replace_cluster_center': replaces the cluster center of the
             cluster where the extreme period belongs to with the periodly
             profile of the extreme period. (Worst case system design)
+    ClusterMethod: {'averaging', 'k_medoids', 'k_means', 'hierarchical'},
+                   default: 'hierachical'
+    predefClusterOrder: Instead of aggregating a time series, a predefined grouping is taken
+            which is given by this list. optional (default: None)
+        :type predefClusterOrder: list or array
 
     Returns
     -------
@@ -81,31 +92,25 @@ def tsam_cluster(timeseries_df,
         Clustered timeseries
     """
 
-    if how == 'daily':
-        hours = 24
-        period = ' days'
-    if how == 'weekly':
-        hours = 168
-        period = ' weeks'
-
-    print('Snapshot clustering to ' + str(typical_periods) + period + 
-          ' using extreme period method: ' + extremePeriodMethod)
+    print('Snapshot clustering to {} periods with {} hours using extreme \
+          period method: {}'.format(typical_periods, hours, extremePeriodMethod))
 
     aggregation = tsam.TimeSeriesAggregation(
         timeseries_df,
         noTypicalPeriods=typical_periods,
         extremePeriodMethod = extremePeriodMethod,
-        addPeakMin = ['residual_load'],
-        addPeakMax = ['residual_load'],
+        # addPeakMin = ['residual_load'],
+        # addPeakMax = ['residual_load'],
         rescaleClusterPeriods=False,
         hoursPerPeriod=hours,
-        clusterMethod='hierarchical')
+        clusterMethod=clusterMethod,
+        solver=solver,
+        predefClusterOrder=predefClusterOrder,
+        )
 
-
-    timeseries = aggregation.createTypicalPeriods()
     cluster_weights = aggregation.clusterPeriodNoOccur
-    clusterOrder =aggregation.clusterOrder
-    clusterCenterIndices= aggregation.clusterCenterIndices
+    clusterOrder = aggregation.clusterOrder
+    clusterCenterIndices = aggregation.clusterCenterIndices
 
     if extremePeriodMethod  == 'new_cluster_center':
         for i in aggregation.extremePeriods.keys():
@@ -119,32 +124,21 @@ def tsam_cluster(timeseries_df,
                     aggregation.extremePeriods[i]['clusterNo'],
                     aggregation.extremePeriods[i]['stepNo'])
 
-    # get all index for every hour of that day of the clusterCenterIndices
-    start = []
-    # get the first hour of the clusterCenterIndices (days start with 0)
-    for i in clusterCenterIndices:
-        start.append(i * hours)
 
+    # get all index for every hour of that day of the clusterCenterIndices
+    # get the first hour of the clusterCenterIndices (days start with 0)
+    start = [i * hours for i in clusterCenterIndices]
     # get a list with all hours belonging to the clusterCenterIndices
-    nrhours = []
-    for j in start:
-        nrhours.append(j)
-        x = 1
-        while x < hours:
-            j = j + 1
-            nrhours.append(j)
-            x = x + 1
+    nrhours = np.concatenate([np.arange(j, j+24) for j in start]).tolist()
 
     # get the origial Datetimeindex
     dates = timeseries_df.iloc[nrhours].index
 
-    #get list of representative days
-    representative_day=[]
-
-    #cluster:medoid des jeweiligen Clusters
+    # cluster:medoid des jeweiligen Clusters
     dic_clusterCenterIndices = dict(enumerate(clusterCenterIndices))
-    for i in clusterOrder:
-        representative_day.append(dic_clusterCenterIndices[i])
+    #get list of representative days
+    representative_day = pd.Series(clusterOrder).map(dic_clusterCenterIndices)
+
 
     #get list of last hour of representative days
     last_hour_datetime=[]
@@ -156,7 +150,7 @@ def tsam_cluster(timeseries_df,
     df_cluster =  pd.DataFrame({
                         'Cluster': clusterOrder, #Cluster of the day
                         'RepresentativeDay': representative_day, #representative day of the cluster
-                        'last_hour_RepresentativeDay': last_hour_datetime}) #last hour of the cluster  
+                        'last_hour_RepresentativeDay': last_hour_datetime}) #last hour of the cluster
     df_cluster.index = df_cluster.index + 1
     df_cluster.index.name = 'Candidate'
 
@@ -166,7 +160,7 @@ def tsam_cluster(timeseries_df,
 
     for i in range(1,int(x)):
         j=1
-        while j <= hours: 
+        while j <= hours:
             nr_day.append(i)
             j=j+1
     df_i_h = pd.DataFrame({'Timeseries': timeseries_df.index,
@@ -176,19 +170,21 @@ def tsam_cluster(timeseries_df,
     return df_cluster, cluster_weights, dates, hours, df_i_h
 
 
-def run(network, n_clusters=None, how='daily',
-        normed=False):
+def run(network, n_clusters=None, hours=24,
+        normed=True):
     """
     """
 
     # calculate clusters
     df_cluster, cluster_weights, dates, hours, df_i_h= tsam_cluster(
-                prepare_pypsa_timeseries(network),
+                prepare_pypsa_timeseries(network, normed),
                 typical_periods=n_clusters,
-                how='daily',
-                extremePeriodMethod = 'None')
+                hours=hours,
+                extremePeriodMethod='None')
     network.cluster = df_cluster
     network.cluster_ts = df_i_h
+    network.set_snapshots(prepare_pypsa_timeseries(network, normed).loc[agg.clusterCenterIndices].index)
+    network.snapshot_weightings[:] = list(agg._clusterPeriodNoOccur.values())
 
     update_data_frames(network, cluster_weights, dates, hours)
 
@@ -200,19 +196,14 @@ def prepare_pypsa_timeseries(network, normed=False):
     """
     if normed:
         normed_loads = network.loads_t.p_set / network.loads_t.p_set.max()
-        normed_loads.columns = 'L' + normed_loads.columns
         normed_renewables = network.generators_t.p_max_pu
-        normed_renewables.columns = 'G' + normed_renewables.columns
-
         df = pd.concat([normed_renewables,
                         normed_loads], axis=1)
     else:
         loads = network.loads_t.p_set.copy()
-        loads.columns = 'L' + loads.columns
         renewables = network.generators_t.p_max_pu.mul(
                 network.generators.p_nom[
                 network.generators_t.p_max_pu.columns], axis = 1).copy()
-        renewables.columns = 'G' + renewables.columns
         residual_load=pd.DataFrame()
         residual_load['residual_load']=loads.sum(axis=1)-renewables.sum(axis=1)
         df = pd.concat([renewables, loads, residual_load], axis=1)
@@ -227,7 +218,7 @@ def update_data_frames(network, cluster_weights, dates, hours):
 
     Parameters
     -----------
-    network : pyPSA network object
+    network : PyPSA network object
     cluster_weights: dictionary
     dates: Datetimeindex
 
