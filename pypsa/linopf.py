@@ -364,12 +364,14 @@ def define_storage_unit_constraints(n, sns, typical_period):
     sus_i = n.storage_units.index
     if sus_i.empty: return
     c = 'StorageUnit'
+
     # spillage
-    upper = get_as_dense(n, c, 'inflow', sns).loc[:, lambda df: df.max() > 0]
+    upper = get_as_dense(n, c, 'inflow', sns)
     spill = write_bound(n, 0, upper)
     set_varref(n, spill, 'StorageUnit', 'spill')
 
-    eh = expand_series(n.snapshot_weightings.loc[sns], sus_i) #elapsed hours
+    # elapsed hours
+    eh = expand_series(n.snapshot_weightings.loc[sns], sus_i)
 
     eff_stand = expand_series(1-n.df(c).standing_loss, sns).T.pow(eh)
     eff_dispatch = expand_series(n.df(c).efficiency_dispatch, sns).T
@@ -381,6 +383,8 @@ def define_storage_unit_constraints(n, sns, typical_period):
         return linexpr((coeff[cols], var[cols]))\
                .reindex(index=axes[0], columns=axes[1], fill_value='').values
 
+# ############################################################################
+# ---------- IMPLEMENTATION STORAGE CONSTRAINTS IF TYPICAL DAYS ARE USED ------
     if typical_period:
         # According to:
         # L. Kotzur et al: 'Time series aggregation for energy system design:
@@ -401,31 +405,33 @@ def define_storage_unit_constraints(n, sns, typical_period):
 
         # SOC_{period, t} ---------------------------------------------------
         previous_soc_intra = soc_intra.groupby(level=0).shift().dropna()
+        next_soc_intra = soc_intra.groupby(level=0).shift(-1).dropna()
+        # elapsed hours dt = 1h
+        eh_intra =  expand_series(sns_multi, sus_i).fillna(1.)
         # (1-nu_self * dt) with time step: dt = 1h
-        eff_stand_intra = (expand_series(1-n.df(c).standing_loss, sns_multi).T
-                           .groupby(level=0).shift().dropna())
+        eff_stand_intra = (expand_series(1-n.df(c).standing_loss, sns_multi).T)
+                           #.groupby(level=0)).shift().dropna())
 
         # lhs = -soc_intra + p_store - p_dispatch - spill + previous_soc_intra
-        lhs = linexpr(
-                     # (eff_stand_intra, previous_soc_intra),    # (1-nu_self dt) * SOC_{period, t}
-                     (eff_store, get_var(n, c, 'p_store')),    # nu_charge * p_store_{period, t}
-                     (-1/eff_dispatch, get_var(n, c, 'p_dispatch')),    # -1/nu_discharge * p_dispatch_{period, t}
-                     (-1, soc_intra)                                      # SOC_{period, t+1}
-                      )
+        # first variables which depend on every snapshot t
+        coeff_var = [(eff_stand_intra, soc_intra)] #,                                                   # SOC_{period, t+1}
+                   #  (-1/eff_dispatch * eh_intra, get_var(n, c, 'p_dispatch')),  # -1/nu_discharge * p_dispatch_{period, t}
+                    # (eff_store * eh_intra, get_var(n, c, 'p_store'))]           # nu_charge * p_store_{period, t}
 
-        axes = [lhs.index, lhs.columns]
-        lhs += masked_term(eff_stand_intra, previous_soc_intra, sus_i)
+        lhs, *axes = linexpr(*coeff_var, return_axes=True)
 
-        if ('StorageUnit', 'spill') in n.variables.index:
-            spill = linexpr((-eh[spill.columns], get_var(n, c, 'spill')))
-            lhs[spill.columns] += spill
+        # (1-nu_self dt) * SOC_{period, t} (not defined for first snapshot of typical day)
+        # lhs += masked_term(eff_stand_intra, previous_soc_intra, sus_i)
+        mul_by = pd.DataFrame(-1, index=next_soc_intra.index, columns=next_soc_intra.columns)
+        lhs += masked_term(mul_by, next_soc_intra, sus_i)
+        lhs += masked_term(-1/eff_dispatch.drop(0, level=1),
+                           get_var(n, c, 'p_dispatch').set_index(sns_multi).drop(0,level=1),
+                           sus_i)
+        lhs += masked_term(eff_store.drop(0, level=1),
+                   get_var(n, c, 'p_store').set_index(sns_multi).drop(0,level=1),
+                   sus_i)
 
-
-        # rhs = -inflow - initial_state_of_charge
-        rhs = -get_as_dense(n, c, 'inflow', sns).reindex(sns_multi)
-
-        lhs.drop(0, level=1, inplace=True)
-        rhs.drop(0, level=1, inplace=True)
+        rhs = 0
 
         define_constraints(n, lhs, '==', rhs, c, 'mu_state_of_charge_intra')
 
@@ -442,39 +448,48 @@ def define_storage_unit_constraints(n, sns, typical_period):
         define_constraints(n, lhs, '==', 0, c, 'mu_state_of_charge_inter_first')
 
         # -------------------------------------------------------------------
-        previous_soc_inter = soc_inter.shift().iloc[1:,:]
+        previous_soc_inter = soc_inter.shift().dropna()
+        next_soc_inter = soc_inter.shift(-1).dropna()
         # assume typical day, number of time steps within period N_g = 24 hours
-        time_steps_within_period = 24
-        eff_stand_inter = expand_series(1-n.df(c).standing_loss, sns_multi.levels[0]).T.pow(time_steps_within_period).iloc[1:,:]
-        # soc_inter(period+1, storageunit) = (soc_inter(period, storageunit)*eff_stand_inter
-        #                                   + soc_intra(period, last_hour))
-        # -soc_inter(period+1, storageunit) + soc_inter(period, storageunit)*eff_stand_inter
-        lhs = linexpr((-1, soc_inter.iloc[1:,:]),
-                       (eff_stand_inter, previous_soc_inter)
-                      )
+        time_steps_within_period = eh.set_index(sns_multi).groupby(level=0).first()
+        eff_stand_inter = expand_series(1-n.df(c).standing_loss, sns_multi.levels[0]).T.pow(time_steps_within_period)
+
+        lhs, *axes = linexpr((eff_stand_inter, soc_inter), return_axes=True)
         # soc intra last hour: soc_intra(period, last_hour)
         soc_intra_last = linexpr((-1, soc_intra),
                                 (-1/eff_dispatch, get_var(n, c, 'p_dispatch')),
                                 (eff_store, get_var(n, c, 'p_store'))).groupby(level=0).last()
-        lhs += soc_intra_last.iloc[1:,:]
+        lhs += soc_intra_last
 
-        rhs = -get_as_dense(n, c, 'inflow', sns).reindex(sns_multi).groupby(level=0).first().iloc[1:,:]
+        mul_by =  pd.DataFrame(-1., index=next_soc_inter.index,
+                               columns=next_soc_inter.columns)
+        lhs += masked_term(mul_by, next_soc_inter, sus_i)
+
+        rhs = 0
 
         define_constraints(n, lhs, '==', rhs, c, 'mu_state_of_charge_inter')
 
+
         # (3) state of charge constraint, Kotzur paper eq. 20 ------------
-        lhs = linexpr((eff_stand_inter.reindex(sns_multi, level=0),
-                       soc_inter.reindex(sns_multi,level=0)),
-                       (1, soc_intra),
-                       (-1, soc.reindex(sns_multi))
-                      )
+        lhs, *axes = linexpr((eff_stand_inter.reindex(sns_multi, level=0),
+                              soc_inter.reindex(sns_multi,level=0)),
+                      (1, soc_intra),
+                      (-1, soc.reindex(sns_multi)), return_axes=True)
 
-        define_constraints(n, lhs, '==', 0, c, 'mu_state_of_charge')
+        if ('StorageUnit', 'spill') in n.variables.index:
+            lhs += masked_term(-eh.reindex(sns_multi), get_var(n, c, 'spill').reindex(sns_multi), spill.columns)
 
+        rhs = -get_as_dense(n, c, 'inflow', sns_multi).mul(eh)
+        define_constraints(n, lhs, '==', rhs, c, 'mu_state_of_charge')
 
+        # cyclic
+        cyclic_i = n.df(c).query('cyclic_state_of_charge').index
+        lhs = linexpr((-1, soc.iloc[0][cyclic_i]),
+                      (1, soc.iloc[-1][cyclic_i]))
 
     # no typical periods
     else:
+
         cyclic_i = n.df(c).query('cyclic_state_of_charge').index
         noncyclic_i = n.df(c).query('~cyclic_state_of_charge').index
 
