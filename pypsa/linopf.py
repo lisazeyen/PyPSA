@@ -1165,8 +1165,6 @@ def network_lopf(n, snapshots=None, solver_name="cbc",
                     keep_shadowprices=keep_shadowprices)
     gc.collect()
 
-    # reset snapshots
-    n.set_snapshots(snapshots)
 
     return status,termination_condition
 

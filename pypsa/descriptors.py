@@ -426,6 +426,8 @@ def snapshot_consistency(n, snapshots, multi_investment_periods):
         if not (all([isinstance(x, int) for x in n.investment_period_weightings.index])
            and all(sorted(n.investment_period_weightings.index)==n.investment_period_weightings.index)):
                 raise TypeError(" Investment periods should be integer and increasing")
+        else:
+            return snapshots
 
 
 
