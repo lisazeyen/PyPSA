@@ -275,7 +275,7 @@ if has_xarray:
                 self.ds['snapshots_' + attr] = snapshots[attr]
 
         def save_investment_periods(self, investment_periods):
-            investment_periods.index.name = 'investment_periods'
+            investment_periods.index.rename('investment_periods', inplace=True)
             for attr in investment_periods.columns:
                 self.ds['investment_periods_' + attr] = investment_periods[attr]
 
