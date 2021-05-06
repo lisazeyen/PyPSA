@@ -926,6 +926,23 @@ def assign_solution(n, sns, variables_sol, constraints_dual,
                         n.component_attrs['Link'].loc[f'p{i}','default']
             else:
                 set_from_frame(pnl, attr, values)
+
+            # map investment costs of learning technologies
+            if c == "Carrier" and attr =='cap_per_period':
+                inv_per_period_v = get_var(n, c, 'inv_per_period', pop=False)
+                inv_per_period = inv_per_period_v.applymap(lambda x: variables_sol.loc[x])
+                capital_cost = round(inv_per_period, ndigits=2)/round(values, ndigits=2)
+                learn_i = capital_cost.columns
+                capital_cost.loc[sns[0][0]].fillna(n.carriers.loc[learn_i, "initial_cost"], inplace=True)
+                capital_cost.fillna(method="ffill", inplace=True)
+                for comp, attribute in nominal_attrs.items():
+                    ext_i = get_extendable_i(n, comp)
+                    if "carrier" not in n.df(comp) or n.df(comp).empty: continue
+                    learn_assets = n.df(comp)[n.df(comp)["carrier"].isin(learn_i)].index
+                    learn_assets = ext_i.intersection(n.df(comp)[n.df(comp)["carrier"].isin(learn_i)].index)
+                    if learn_assets.empty: continue
+                    n.df(comp).loc[learn_assets, "capital_cost"] = n.df(comp).loc[learn_assets].apply(lambda x: capital_cost.loc[x.loc["build_year"], x.loc["carrier"]],
+                                                                                    axis=1)
         else:
             # case that variables are static
             n.solutions.at[(c, attr), 'pnl'] = False

@@ -360,6 +360,7 @@ def _export_to_exporter(network, exporter, basename, export_standard_types=False
             continue
 
         col_export = []
+        attrs = attrs[~attrs.index.duplicated(keep='first')]
         for col in df.columns:
             # do not export derived attributes
             if col in ["sub_network", "r_pu", "x_pu", "g_pu", "b_pu"]:
@@ -713,6 +714,8 @@ def import_components_from_dataframe(network, dataframe, cls_name):
 
     static_attrs = attrs[attrs.static].drop("name")
     non_static_attrs = attrs[~attrs.static]
+    # drop dubplicated index 'carrier'
+    static_attrs = static_attrs[~static_attrs.index.duplicated(keep='first')]
 
     # Clean dataframe and ensure correct types
     dataframe = pd.DataFrame(dataframe)

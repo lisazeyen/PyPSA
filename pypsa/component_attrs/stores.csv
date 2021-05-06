@@ -19,6 +19,7 @@ capital_cost,float,currency/MWh,0,Capital cost of extending e_nom by 1 MWh.,Inpu
 standing_loss,float,per unit,0,Losses per hour to energy.,Input (optional)
 build_year,int,year,0,build year,Input (optional)
 lifetime,float,years,inf,lifetime,Input (optional)
+carrier,string,n/a,n/a,"Prime mover energy carrier (e.g. battery, H2); required for technology learning",Input (optional)
 p,series,MW,0,active power at bus (positive if net generation),Output
 q,series,MVar,0,reactive power (positive if net generation),Output
 e,series,MWh,0,Energy as calculated by the OPF.,Output
