@@ -115,7 +115,7 @@ n = pypsa.Network()
 years = [2020, 2030, 2040, 2050]
 investment = pd.DatetimeIndex(['{}-01-01 00:00'.format(year) for year in years])
 # temporal resolution
-freq = "2190"
+freq = "24"
 # snapshots (format -> DatetimeIndex)
 snapshots = pd.DatetimeIndex([])
 snapshots = snapshots.append([(pd.date_range(start ='{}-01-01 00:00'.format(year),
@@ -380,4 +380,4 @@ n.add("Load",
       p_set=0.3*load_fix)
 
 # currently only for pyomo=False
-n.lopf(pyomo=False, multi_investment_periods=True)
+n.lopf(pyomo=False, multi_investment_periods=True, solver_name="gurobi")

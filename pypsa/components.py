@@ -493,7 +493,7 @@ class Network(Basic):
     def lopf(self, snapshots=None, pyomo=True, solver_name="glpk",
              solver_options={}, solver_logfile=None, formulation="kirchhoff",
              keep_files=False, extra_functionality=None,
-             multi_investment_periods=False, **kwargs):
+             multi_investment_periods=False, typical_period=False, **kwargs):
         """
         Linear optimal power flow for a group of snapshots.
 
@@ -600,7 +600,8 @@ class Network(Basic):
                 'solver_options': solver_options, 'formulation': formulation,
                 'extra_functionality': extra_functionality,
                 'solver_name': solver_name, 'solver_logfile': solver_logfile,
-                'multi_investment_periods': multi_investment_periods}
+                'multi_investment_periods': multi_investment_periods,
+                'typical_period': typical_period}
         args.update(kwargs)
 
         if not self.shunt_impedances.empty:
@@ -652,7 +653,8 @@ class Network(Basic):
         attrs = self.components[class_name]["attrs"]
 
         static_attrs = attrs[attrs.static].drop("name")
-
+        # drop duplicates (which appear through new attribute carrier)
+        static_attrs = static_attrs.loc[~static_attrs.index.duplicated()]
         #This guarantees that the correct attribute type is maintained
         obj_df = pd.DataFrame(data=[static_attrs.default],index=[name],columns=static_attrs.index)
         new_df = cls_df.append(obj_df, sort=False)
@@ -915,6 +917,7 @@ class Network(Basic):
             network.snapshot_weightings = self.snapshot_weightings.loc[snapshots].copy()
             network.investment_period_weightings = self.investment_period_weightings.loc[investment_periods].copy()
         else:
+            investment_periods = self.investment_period_weightings.index
             network.snapshot_weightings = self.snapshot_weightings.copy()
             network.investment_period_weightings = self.investment_period_weightings.loc[investment_periods].copy()
 
